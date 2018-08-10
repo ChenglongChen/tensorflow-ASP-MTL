@@ -58,6 +58,7 @@ params = {
 
     "loss_adv_weight": 0.05,
     "loss_diff_weight": 0.01,
+    "loss_domain_weight": 0.01,
     "loss_l2_lambda": 0.,
 
     "batch_size": 16,

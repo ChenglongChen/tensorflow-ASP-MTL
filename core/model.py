@@ -81,26 +81,27 @@ class SharedPrivateModel(object):
             summary = tf.summary.merge(
                 tf.get_collection(tf.GraphKeys.SUMMARIES, self.model_name)
             )
-        return summary
+            return summary
 
 
     def _get_embedding_matrix(self):
-        if self.init_embedding_matrix is None:
-            std = 0.1
-            minval = -std
-            maxval = std
-            emb_matrix = tf.Variable(
-                tf.random_uniform(
-                    # 0: padding
-                    # max_num_word + 1: oov
-                    [self.params["max_num_word"] + 2, self.params["embedding_dim"]],
-                    minval, maxval,
-                    seed=self.params["random_seed"],
-                    dtype=tf.float32))
-        else:
-            emb_matrix = tf.Variable(self.init_embedding_matrix,
-                                     trainable=self.params["embedding_trainable"])
-        return emb_matrix
+        with tf.name_scope("embedding"):
+            if self.init_embedding_matrix is None:
+                std = 0.1
+                minval = -std
+                maxval = std
+                emb_matrix = tf.Variable(
+                    tf.random_uniform(
+                        # 0: padding
+                        # max_num_word + 1: oov
+                        [self.params["max_num_word"] + 2, self.params["embedding_dim"]],
+                        minval, maxval,
+                        seed=self.params["random_seed"],
+                        dtype=tf.float32))
+            else:
+                emb_matrix = tf.Variable(self.init_embedding_matrix,
+                                         trainable=self.params["embedding_trainable"])
+            return emb_matrix
 
 
     def _base_feature_extractor(self, emb_seq, seq_len, name, reuse):
@@ -136,37 +137,50 @@ class SharedPrivateModel(object):
             return self._base_feature_extractor(emb_seq, seq_len, name="%s_private_part"%task_name, reuse=False)
 
 
-    def _shared_task_discriminator(self, feature):
+    def _domain_discriminator_with_shared_features(self, shared_features):
+        """
+         domain discriminator based only on shared features
+         it is shared across all the tasks
+         """
         with tf.name_scope("shared_part/"):
-            return tf.layers.dense(feature, len(self.task_names), reuse=tf.AUTO_REUSE, name="shared_task_discriminator")
+            return tf.layers.dense(shared_features, len(self.task_names), reuse=tf.AUTO_REUSE, name="task_discriminator_with_shared_features")
 
 
-    def _adversarial_loss(self, shared_samples, task_labels):
+    def _domain_discriminator_with_private_features(self, private_features):
+        """
+        task discriminator based only on private features
+        it is shared across all the tasks
+        """
         with tf.name_scope("shared_part/"):
-            shared_samples = self.flip_gradient(shared_samples)
-            shared_samples = tf.layers.Dropout(self.params["fc_dropout"])(shared_samples, self.training)
+            return tf.layers.dense(private_features, len(self.task_names), reuse=tf.AUTO_REUSE, name="task_discriminator_with_private_features")
 
-            logits = self._shared_task_discriminator(shared_samples)
+
+    def _adversarial_loss(self, shared_features, task_labels):
+        with tf.name_scope("shared_part/"):
+            shared_features = self.flip_gradient(shared_features)
+            shared_features = tf.layers.Dropout(self.params["fc_dropout"])(shared_features, self.training)
+
+            logits = self._domain_discriminator_with_shared_features(shared_features)
             loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=task_labels, logits=logits)
             loss = tf.reduce_mean(loss)
 
             return loss
 
 
-    def _difference_loss(self, private_samples, shared_samples, weight=1.0):
+    def _difference_loss(self, private_features, shared_features, weight=1.0):
         '''
         Paper: Domain Separation Networks
         Code: https://github.com/tensorflow/models/blob/master/research/domain_adaptation/domain_separation/losses.py
         '''
         with tf.name_scope("shared_part/"):
-            private_samples -= tf.reduce_mean(private_samples, 0)
-            shared_samples -= tf.reduce_mean(shared_samples, 0)
+            private_features -= tf.reduce_mean(private_features, 0)
+            shared_features -= tf.reduce_mean(shared_features, 0)
 
-            private_samples = tf.nn.l2_normalize(private_samples, 1)
-            shared_samples = tf.nn.l2_normalize(shared_samples, 1)
+            private_features = tf.nn.l2_normalize(private_features, 1)
+            shared_features = tf.nn.l2_normalize(shared_features, 1)
 
             correlation_matrix = tf.matmul(
-                private_samples, shared_samples, transpose_a=True)
+                private_features, shared_features, transpose_a=True)
 
             cost = tf.reduce_mean(tf.square(correlation_matrix)) * weight
             cost = tf.where(cost > 0, cost, 0, name='value')
@@ -174,6 +188,21 @@ class SharedPrivateModel(object):
             assert_op = tf.Assert(tf.is_finite(cost), [cost])
             with tf.control_dependencies([assert_op]):
                 loss = tf.identity(cost)
+
+            return loss
+
+
+    def _domain_loss(self, private_features, task_labels):
+        '''
+        Paper: Cross-Domain Review Helpfulness Prediction based on Convolutional Neural Networks
+        with Auxiliary Domain Discriminators
+        '''
+        with tf.name_scope("shared_part/"):
+            private_features = tf.layers.Dropout(self.params["fc_dropout"])(private_features, self.training)
+
+            logits = self._domain_discriminator_with_private_features(private_features)
+            loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=task_labels, logits=logits)
+            loss = tf.reduce_mean(loss)
 
             return loss
 
@@ -200,22 +229,26 @@ class SharedPrivateModel(object):
         feature = tf.layers.Dropout(self.params["fc_dropout"])(feature, self.training)
 
         #### task classifier
+        # for mtl-dataset, label is 0/1 for all the tasks
         logits = tf.layers.dense(feature, 2)
         probas = tf.nn.softmax(logits)
         loss_task = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=self.labels[task_name], logits=logits)
         loss_task = tf.reduce_mean(loss_task)
 
-        #### shared classifier
+        #### auxiliary losses
         loss_adv = self._adversarial_loss(shared_features, self.task_labels[task_name])
         loss_diff = self._difference_loss(shared_features, private_features)
+        loss_domain = self._domain_loss(private_features, self.task_labels[task_name])
 
-        #### loss
+        #### overall loss
         loss = loss_task
-        if self.params["loss_adv_weight"] > 0:
+        if "loss_adv_weight" in self.params and self.params["loss_adv_weight"] > 0:
             loss += self.params["loss_adv_weight"] * loss_adv
-        if self.params["loss_diff_weight"] > 0:
+        if "loss_diff_weight" in self.params and self.params["loss_diff_weight"] > 0:
             loss += self.params["loss_diff_weight"] * loss_diff
-        if self.params["loss_l2_lambda"] > 0:
+        if "loss_domain_weight" in self.params and self.params["loss_domain_weight"] > 0:
+            loss += self.params["loss_domain_weight"] * loss_domain
+        if "loss_l2_lambda" in self.params and self.params["loss_l2_lambda"] > 0:
             l2_losses = tf.add_n([tf.nn.l2_loss(v) for v in tf.trainable_variables() if "bias" not in v.name])
             loss += self.params["loss_l2_lambda"] * l2_losses
 
